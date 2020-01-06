@@ -1,0 +1,2 @@
+ curl -G 'http://storage.dayton.home:8086/query?pretty=true' --data-urlencode "db=beta" --data-urlencode "q=SELECT \"powerState\" FROM \"controller_property\" WHERE \"endpoint\"='hue:lights:1'";
+
