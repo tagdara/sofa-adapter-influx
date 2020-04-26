@@ -52,6 +52,15 @@ class influxServer(sofabase):
             try:
                 endpointId=message['event']['endpoint']['endpointId']
                 for change in message['event']['payload']['change']['properties']:
+                    
+                    if 'exclude' in self.dataset.config:
+                        if endpointId in self.dataset.config['exclude']:
+                            return False
+                    
+                    if 'exclude_adapters' in self.dataset.config:
+                        for ea in self.dataset.config['exclude_adapters']:
+                            if endpointId.startswith(ea):
+                                return False
 
                     if type(change['value'])==dict:
                         if 'value' in change['value']:
@@ -69,7 +78,8 @@ class influxServer(sofabase):
                             "fields": { change["name"] : change["value"]}
                         }]
                         self.influxclient.write_points(line,database='beta')
-                        self.log.info('<< Influx: %s' % line)
+                        if 'log_changes' in self.dataset.config and self.dataset.config['log_changes']==True:
+                            self.log.info('<< Influx: %s' % line)
                 
             except:
                 self.log.warn('Problem with value data: %s of type %s' % (change['value'], type(change['value'])))
@@ -217,12 +227,16 @@ class influxServer(sofabase):
                     self.log.info('influx query: %s' % query)
                     qry=query
                     result=self.influxclient.query(qry,database='beta')
-                    return result.raw
+                    response=list(result.get_points())
+                    #return result.raw
+                    return response
+                    #return result.raw
 
                 if itempath[0]=="querylist":
                     self.log.info('influx query: %s' % query)
-                    qry=query
-                    result=self.influxclient.query(qry,database='beta')
+                    
+                    qry=json.loads(query)['query']
+                    result=self.influxclient.query(qry,epoch='s',database='beta')
                     response=list(result.get_points())
                     #return result.raw
                     return response
