@@ -5,28 +5,45 @@ import sys, os
 sys.path.append(os.path.dirname(__file__))
 sys.path.append(os.path.join(os.path.dirname(__file__),'../../base'))
 
-from sofabase import sofabase
-from sofabase import adapterbase
+from sofabase import sofabase, adapterbase, configbase
 import devices
+from sofacollector import SofaCollector
 
 import json
 import asyncio
 import concurrent.futures
 import datetime
 import uuid
-import influxdb
+#import influxdb import InfluxDBClient
+import requests
+from struct import pack, unpack
+
+from aioinflux import InfluxDBClient, iterpoints
 
 class influxServer(sofabase):
 
-    class adapterProcess():
+    class adapter_config(configbase):
     
-        def __init__(self, log=None, loop=None, dataset=None, notify=None, request=None, **kwargs):
+        def adapter_fields(self):
+            self.exclude=self.set_or_default('exclude', default=[])
+            self.exclude_adapters=self.set_or_default('exclude_adapters', default=[])
+            self.db_server=self.set_or_default('db_server', mandatory=True)
+
+    class adapterProcess(SofaCollector.collectorAdapter):
+
+        @property
+        def collector_categories(self):
+            return ['ALL']    
+    
+        def __init__(self, log=None, loop=None, dataset=None, notify=None, request=None, config=None, **kwargs):
+            self.config=config
             self.dataset=dataset
             #self.definitions=definitions.Definitions
             self.log=log
             self.notify=notify
             self.dbConnected=False
             self.dbRetries=0
+
             if not loop:
                 self.loop = asyncio.new_event_loop()
             else:
@@ -46,21 +63,22 @@ class influxServer(sofabase):
             self.polltime=1
             self.dblistcache=[]
             self.log.info('.. Starting Influx Manager')
-            self.connectDatabase('beta')
+            try:
+                self.connectDatabase('beta')
+            except:
+                self.log.error('!! Problem starting influx client', exc_info=True)
                 
         async def handleChangeReport(self, message):
             try:
                 endpointId=message['event']['endpoint']['endpointId']
                 for change in message['event']['payload']['change']['properties']:
                     
-                    if 'exclude' in self.dataset.config:
-                        if endpointId in self.dataset.config['exclude']:
-                            return False
+                    if endpointId in self.config.exclude:
+                        return False
                     
-                    if 'exclude_adapters' in self.dataset.config:
-                        for ea in self.dataset.config['exclude_adapters']:
-                            if endpointId.startswith(ea):
-                                return False
+                    for ea in self.config.exclude_adapters:
+                        if endpointId.startswith(ea):
+                            return False
 
                     if type(change['value'])==dict:
                         if 'value' in change['value']:
@@ -77,14 +95,45 @@ class influxServer(sofabase):
                             "time": change["timeOfSample"],
                             "fields": { change["name"] : change["value"]}
                         }]
-                        self.influxclient.write_points(line,database='beta')
-                        if 'log_changes' in self.dataset.config and self.dataset.config['log_changes']==True:
-                            self.log.info('<< Influx: %s' % line)
-                
-            except:
-                self.log.warn('Problem with value data: %s of type %s' % (change['value'], type(change['value'])))
-                self.log.error("Error handling change report for %s" % message,exc_info=True)            
+                        asyncio.create_task(self.database_write_data(line))
 
+            except requests.exceptions.ConnectionError:
+                self.log.error("!! InfluxDB server connection error - did not save change report for %s" % message) 
+            except:
+                self.log.warn('!! Problem with value data: %s of type %s' % (change['value'], type(change['value'])))
+                self.log.error("!! Error handling change report for %s" % message,exc_info=True)            
+
+        async def database_write_data(self, data, db="beta"):
+            
+            try:
+                if self.config.log_changes:
+                    self.log.info('<< Influx: %s' % data)
+                for point in data:
+                    async with InfluxDBClient(db=db, host=self.config.db_server) as client:
+                        #await client.create_database(db='testdb')
+                        await client.create_database(db=db)
+                        await client.write(point)
+
+                #self.influxclient.write_points(data, database='beta')
+            except:
+                self.log.error('!! Error writing to database: %s' % data, exc_info=True)
+
+        async def database_query(self, query, db="beta"):
+            
+            try:
+                if self.config.log_changes:
+                    self.log.info('<< Influx: %s' % query)
+                async with InfluxDBClient(db=db, host=self.config.db_server) as client:
+                    #await client.create_database(db='testdb')
+                    await client.create_database(db=db)
+                    resp = await client.query(query, epoch='ms')
+                    return resp
+
+                #self.influxclient.write_points(data, database='beta')
+            except:
+                self.log.error('!! Error writing to database: %s' % data, exc_info=True)
+
+                    
 
         def retryDatabase(self, dbname):
             
@@ -99,11 +148,6 @@ class influxServer(sofabase):
         def connectDatabase(self, dbname):
             
             try:
-                self.influxclient=influxdb.InfluxDBClient(self.dataset.config['dbserver'])
-                dbs=self.influxclient.get_list_database()    
-                if not self.databaseExists(dbname):
-                    self.createDatabase(dbname)
-                self.log.info('Databases: %s' % dbs)
                 self.dbConnected=True
                 self.dbRetries=0
             except:
@@ -134,60 +178,46 @@ class influxServer(sofabase):
             except:
                 self.log.info("Could not look for Database "+dbname,exc_info=True)
 
-        def writeInflux(self, adapter, item, data):
+        async def convert_points_to_list(self, result):
+            try:
+                self.log.info('Starting data: %s' % result)
+                response=[]
+                if 'results' in result and 'series' in result['results'][0]:
+                    series_data=result['results'][0]['series']
+                    pointlist=[]
+                    for item in series_data:
+                        for point in item['values']:
+                            pointdata={}
+                            for x,field in enumerate(point):
+                                pointdata[item['columns'][x]]=field
+                            pointlist.append(pointdata)
+                            #response[pointdata['endpoint']]=pointdata
+            except:
+                self.log.error('!! error converting points', exc_info=True)
+            return pointlist
         
-            try:
-                if type(data)==list:
-                    self.log.info('List data is not currently supported in the influx history database: %s' % (item))
-                    return None
             
-                if not self.databaseExists(adapter):
-                    self.createDatabase(adapter)
-                
-                ifjson=[{'measurement':item,'fields': {'value':data}}]
-                
-                try:
-                    while not self.dbConnected:
-                        self.retryDatabaseConnection('beta')
-                    self.influxclient.write_points(ifjson,database=adapter)
-                except ConnectionRefusedError:
-                    self.dbConnected=False
-                    self.retryDatabaseConnection('beta')
-                
-                self.log.info('Sent %s to influx' % ifjson)
-
-            except:
-                self.log.error('Error inserting influx data with the following value: %s = %s (%s)' % (item, data, ifjson),exc_info=True)
-
-
-        def virtualControllers(self, itempath):
-
-            try:
-                return {}
-
-            except:
-                self.log.error('Error getting virtual controller types for %s' % itempath, exc_info=True)
-
         async def virtualList(self, itempath, query={}):
 
             try:
+                self.log.info('list request: %s %s' % (itempath, query))
                 itempath=itempath.split('/')
                 if itempath[0]=="powerState":
                     qry='select endpoint,powerState from controller_property'
                     if len(itempath)>1:
                         qry=qry+" where endpoint='%s'" % itempath[1]
-                    self.log.info('Running query: %s' % qry)
-                    result=self.influxclient.query(qry,database='beta')
+                    self.log.info('.. query: %s' % qry)
+                    result=await self.database_query(qry)
+                    #result=self.influxclient.query(qry,database='beta')
                     return result.raw
 
                 if itempath[0]=="last":
-                    self.log.info('getting last info for %s - query: %s' % (itempath, query))
+                    self.log.info('.. getting last info for %s - query: %s' % (itempath, query))
                     if query:
                         elist=json.loads(query)
                         rgx="~ /%s/" % "|".join(elist)
                         qry="select endpoint,last(%s) from controller_property where endpoint=%s group by endpoint" % (itempath[1], rgx)
                     else:
-                        self.log.info('getting last info for %s' % itempath)
                         if len(itempath)>2:
                             qry="select endpoint,last(%s) from controller_property where endpoint='%s'" % (itempath[2], itempath[1])
                             if len(itempath)>3:
@@ -195,18 +225,35 @@ class influxServer(sofabase):
                         else:
                             qry="select endpoint,last(%s) from controller_property" % itempath[1]
 
-                    self.log.info('Running query: %s' % qry)
-                    result=self.influxclient.query(qry,database='beta')
+                    self.log.debug('.. running query: %s' % qry)
+                    #result=self.influxclient.query(qry,database='beta')
+                    result=await self.database_query(qry)
 
                     if query:
                         response={}
-                        responselist=list(result.get_points())
-                        for dp in responselist:
-                            response[dp['endpoint']]=dp
-                            
+                        if 'results' in result and 'series' in result['results'][0]:
+                            series_data=result['results'][0]['series']
+                            pointlist=[]
+                            for item in series_data:
+                                for point in item['values']:
+                                    pointdata={}
+                                    for x,field in enumerate(point):
+                                        pointdata[item['columns'][x]]=field
+                                    pointlist.append(pointdata)
+                                    response[pointdata['endpoint']]=pointdata
                     else:
-                        response=list(result.get_points())[0]
-                    #return result.raw
+                        response=result
+                        if 'results' in result and 'series' in result['results'][0]:
+                            last_data=result['results'][0]['series'][0]
+                            pointlist=[]
+                            for point in last_data['values']:
+                                pointdata={}
+                                for x,field in enumerate(point):
+                                    pointdata[last_data['columns'][x]]=field
+                                pointlist.append(pointdata)
+                            response=pointlist[0]
+                                
+                        self.log.info('response: %s ' % response)
                     return response
 
                 if itempath[0]=="history":
@@ -217,8 +264,11 @@ class influxServer(sofabase):
 
                         qry="select endpoint,%s from controller_property where endpoint='%s' ORDER BY time DESC LIMIT 50 OFFSET %s" % (itempath[2],itempath[1],offset)
                     self.log.info('Running history query: %s' % qry)
-                    result=self.influxclient.query(qry,database='beta')
-                    response=list(result.get_points())
+                    #result=self.influxclient.query(qry,database='beta')
+                    result=await self.database_query(qry)
+                    response=await self.convert_points_to_list(result)
+                    self.log.info('response: %s' % response)
+                    #response=list(result.get_points())
                     #return result.raw
                     return response
 
@@ -226,7 +276,8 @@ class influxServer(sofabase):
                 if itempath[0]=="query":
                     self.log.info('influx query: %s' % query)
                     qry=query
-                    result=self.influxclient.query(qry,database='beta')
+                    #result=self.influxclient.query(qry,database='beta')
+                    result=await self.database_query(qry)
                     response=list(result.get_points())
                     #return result.raw
                     return response
@@ -236,7 +287,8 @@ class influxServer(sofabase):
                     self.log.info('influx query: %s' % query)
                     
                     qry=json.loads(query)['query']
-                    result=self.influxclient.query(qry,epoch='s',database='beta')
+                    #result=await self.influxclient.query(qry,epoch='s',database='beta')
+                    result=await self.database_query(qry)
                     response=list(result.get_points())
                     #return result.raw
                     return response
@@ -247,13 +299,6 @@ class influxServer(sofabase):
                 self.log.error('Error getting virtual controller types for %s' % itempath, exc_info=True)
 
 
-
-        def virtualControllerProperty(self, nativeObj, controllerProp):
-        
-            # Scenes have no properties
-            return None
-
-        
 
 if __name__ == '__main__':
     adapter=influxServer(name='influx')
