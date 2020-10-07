@@ -36,10 +36,7 @@ class influxServer(sofabase):
             return ['ALL']    
     
         def __init__(self, log=None, loop=None, dataset=None, notify=None, request=None, config=None, **kwargs):
-            self.config=config
-            self.dataset=dataset
-            #self.definitions=definitions.Definitions
-            self.log=log
+            super().__init__(log=log, loop=loop, dataset=dataset, config=config)
             self.notify=notify
             self.dbConnected=False
             self.dbRetries=0
