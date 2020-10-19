@@ -19,6 +19,8 @@ import requests
 from struct import pack, unpack
 
 from aioinflux import InfluxDBClient, iterpoints
+import inspect
+import itertools
 
 class influxServer(sofabase):
 
@@ -175,29 +177,44 @@ class influxServer(sofabase):
             except:
                 self.log.info("Could not look for Database "+dbname,exc_info=True)
 
-        async def convert_points_to_list(self, result):
+
+        async def convert_points_to_list(self, data):
+            
+            def dict_parser(*x, meta):
+                return dict(zip(meta['columns'], x))
+
+            result=[]
             try:
-                self.log.info('Starting data: %s' % result)
-                response=[]
-                if 'results' in result and 'series' in result['results'][0]:
-                    series_data=result['results'][0]['series']
-                    pointlist=[]
-                    for item in series_data:
-                        for point in item['values']:
-                            pointdata={}
-                            for x,field in enumerate(point):
-                                pointdata[item['columns'][x]]=field
-                            pointlist.append(pointdata)
-                            #response[pointdata['endpoint']]=pointdata
+                result=self.if_iterpoints(data,dict_parser)
             except:
                 self.log.error('!! error converting points', exc_info=True)
-            return pointlist
-        
+            return result
+
+
+        def if_iterpoints(self, resp, parser=None):
+            # TODO/CHEESE: Iterpoints in the aioinflux module only handles simple requests without a group-by
+            # https://github.com/gusutabopb/aioinflux/issues/29
+            # This is supposed to be fixed in a follow-on release, but has not been pushed to the official build.
+            gs = []
+            for statement in resp['results']:
+                if 'series' not in statement:
+                    continue
+                for series in statement['series']:
+                    if parser is None:
+                        gs.append((x for x in series['values']))
+                    elif 'meta' in inspect.signature(parser).parameters:
+                        meta = {k: series[k] for k in series if k != 'values'}
+                        meta['statement_id'] = statement['statement_id']
+                        gs.append((parser(*x, meta=meta) for x in series['values']))
+                    else:
+                        gs.append((parser(*x) for x in series['values']))
+            return itertools.chain(*gs)
+
             
         async def virtualList(self, itempath, query={}):
 
             try:
-                self.log.info('list request: %s %s' % (itempath, query))
+                self.log.info('<< list %s %s' % (itempath, query))
                 itempath=itempath.split('/')
                 if itempath[0]=="powerState":
                     qry='select endpoint,powerState from controller_property'
@@ -208,8 +225,8 @@ class influxServer(sofabase):
                     #result=self.influxclient.query(qry,database='beta')
                     return result.raw
 
-                if itempath[0]=="last":
-                    self.log.info('.. getting last info for %s - query: %s' % (itempath, query))
+                elif itempath[0]=="last":
+                    self.log.info('-> influx last query %s - %s' % (itempath, query))
                     if query:
                         elist=json.loads(query)
                         rgx="~ /%s/" % "|".join(elist)
@@ -222,79 +239,48 @@ class influxServer(sofabase):
                         else:
                             qry="select endpoint,last(%s) from controller_property" % itempath[1]
 
-                    self.log.debug('.. running query: %s' % qry)
-                    #result=self.influxclient.query(qry,database='beta')
-                    result=await self.database_query(qry)
-
-                    if query:
-                        response={}
-                        if 'results' in result and 'series' in result['results'][0]:
-                            series_data=result['results'][0]['series']
-                            pointlist=[]
-                            for item in series_data:
-                                for point in item['values']:
-                                    pointdata={}
-                                    for x,field in enumerate(point):
-                                        pointdata[item['columns'][x]]=field
-                                    pointlist.append(pointdata)
-                                    response[pointdata['endpoint']]=pointdata
-                    else:
-                        response=result
-                        if 'results' in result and 'series' in result['results'][0]:
-                            last_data=result['results'][0]['series'][0]
-                            pointlist=[]
-                            for point in last_data['values']:
-                                pointdata={}
-                                for x,field in enumerate(point):
-                                    pointdata[last_data['columns'][x]]=field
-                                pointlist.append(pointdata)
-                            response=pointlist[0]
-                                
-                        self.log.info('response: %s ' % response)
+                    database_result=await self.database_query(qry)
+                    result=await self.convert_points_to_list(database_result)
+                    response={}
+                    for obj in result:
+                        if 'endpoint' in obj:
+                            response[obj['endpoint']]=obj
+                    self.log.info('>> list response %s items' % len(response))
                     return response
 
-                if itempath[0]=="history":
+                elif itempath[0]=="history":
                     if len(itempath)>3:
                         offset=int(itempath[3])*50
                     else:
                         offset=0
-
                         qry="select endpoint,%s from controller_property where endpoint='%s' ORDER BY time DESC LIMIT 50 OFFSET %s" % (itempath[2],itempath[1],offset)
-                    self.log.info('Running history query: %s' % qry)
-                    #result=self.influxclient.query(qry,database='beta')
-                    result=await self.database_query(qry)
-                    response=await self.convert_points_to_list(result)
-                    self.log.info('response: %s' % response)
-                    #response=list(result.get_points())
-                    #return result.raw
+                    self.log.info('-> influx history query: %s' % qry)
+                    database_result=await self.database_query(qry)
+                    result=await self.convert_points_to_list(database_result)
+                    response=[]
+                    for obj in result:
+                        response.append(obj)
+                    self.log.info('>> list response %s items' % response)
                     return response
 
 
-                if itempath[0]=="query":
-                    self.log.info('influx query: %s' % query)
-                    qry=query
-                    #result=self.influxclient.query(qry,database='beta')
-                    result=await self.database_query(qry)
+                elif itempath[0]=="query":
+                    self.log.info('-> influx query: %s' % query)
+                    result=await self.database_query(query)
                     response=list(result.get_points())
-                    #return result.raw
                     return response
-                    #return result.raw
-
-                if itempath[0]=="querylist":
-                    self.log.info('influx query: %s' % query)
                     
+
+                elif itempath[0]=="querylist":
+                    self.log.info('influx query: %s' % query)
                     qry=json.loads(query)['query']
-                    #result=await self.influxclient.query(qry,epoch='s',database='beta')
                     result=await self.database_query(qry)
                     response=list(result.get_points())
-                    #return result.raw
                     return response
                     
-                return {}
-
             except:
                 self.log.error('Error getting virtual controller types for %s' % itempath, exc_info=True)
-
+            return {}
 
 
 if __name__ == '__main__':
